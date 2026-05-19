@@ -6,19 +6,24 @@ Downloads NBA archive files from shufinskiy/nba_data into local data/ folder.
 Scope: NBA only (no WNBA), all 7 data types, regular season + playoffs, all
 available seasons (1996/97 onward, where present per source).
 
-Resumable: rerun freely. Files already on disk that pass tar.xz validation
-are skipped. Partial or corrupt files are redownloaded.
-
-Output:
-  data/{name}.tar.xz                   one archive per data type per season
-  data/_manifest.json                  ledger of what was downloaded
+Smart resume:
+  - Missing files -> downloaded.
+  - Corrupt local files -> redownloaded.
+  - Valid local files -> HEAD upstream and compare Content-Length. If sizes
+    differ, redownload (upstream re-published). If sizes match, skip.
+  - --force-current-season redownloads any file whose season is >= the
+    --current-season-floor (default 2025 = the 2025/26 season). Useful for
+    weekly cron, since active-season files can be re-uploaded with identical
+    byte counts but different content.
 
 Usage:
   python scripts/01_download_archives.py
+  python scripts/01_download_archives.py --force-current-season
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import tarfile
@@ -30,8 +35,6 @@ from urllib.error import HTTPError, URLError
 import requests
 from tqdm import tqdm
 
-
-# ---------- Configuration ----------
 
 LIST_URL = "https://raw.githubusercontent.com/shufinskiy/nba_data/main/list_data.txt"
 
@@ -45,34 +48,20 @@ DATA_TYPES = (
     "cdnnba",
 )
 
-# Earliest season per data type (per Shufinskiy README). The script asks the
-# upstream list_data.txt what actually exists, so these are just the floor
-# for what we expect to find. Anything not present upstream is logged as
-# "skipped (not in upstream list)".
 SEASON_FLOOR = 1996
-SEASON_CEIL = 2025  # 2025 = the 2025/26 season
+SEASON_CEIL = 2025
 
-SEASON_TYPES = ("rg", "po")  # regular season + playoffs
-
-# Where to put files (relative to repo root, which is the parent of scripts/)
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = REPO_ROOT / "data"
 MANIFEST_PATH = DATA_DIR / "_manifest.json"
 
-# Network behavior
-CHUNK_SIZE = 1024 * 64       # 64 KB chunks for download progress
-REQUEST_TIMEOUT = 60         # seconds per HTTP call
-INTER_FILE_DELAY = 0.5       # seconds between downloads, be polite
+CHUNK_SIZE = 1024 * 64
+REQUEST_TIMEOUT = 60
+INTER_FILE_DELAY = 0.5
 USER_AGENT = "nba-data-archive/0.1 (https://github.com/jsierrahoopshype/nba-data-archive)"
 
 
-# ---------- Helpers ----------
-
 def fetch_upstream_list() -> dict[str, str]:
-    """
-    Pulls list_data.txt from Shufinskiy's repo and returns {name: url}.
-    Names look like 'shotdetail_2024' or 'pbpstats_po_2023' (no '.tar.xz').
-    """
     req = Request(LIST_URL, headers={"User-Agent": USER_AGENT})
     with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
         if resp.status != 200:
@@ -90,10 +79,6 @@ def fetch_upstream_list() -> dict[str, str]:
 
 
 def build_wanted_names() -> list[str]:
-    """
-    Builds the canonical list of names we want, in a sensible download order:
-    by data type, regular season first (oldest to newest), then playoffs.
-    """
     names: list[str] = []
     for dtype in DATA_TYPES:
         for season in range(SEASON_FLOOR, SEASON_CEIL + 1):
@@ -103,30 +88,49 @@ def build_wanted_names() -> list[str]:
     return names
 
 
+def season_of(name: str) -> int | None:
+    for p in reversed(name.split("_")):
+        if p.isdigit() and len(p) == 4:
+            return int(p)
+    return None
+
+
 def is_valid_tar_xz(path: Path) -> bool:
-    """Returns True if the file opens cleanly as a tar.xz archive."""
     if not path.exists() or path.stat().st_size == 0:
         return False
     try:
         with tarfile.open(path, mode="r:xz") as tar:
-            # Touch the member list so we actually parse the index.
             tar.getmembers()
         return True
     except (tarfile.TarError, EOFError, OSError):
         return False
 
 
-def download_file(name: str, url: str, dest: Path) -> tuple[str, int, str]:
-    """
-    Streams a file to dest, with a per-file progress bar.
-    Returns (status, size_bytes, message). Status is one of:
-      'downloaded' | 'skipped_existing' | 'skipped_missing_upstream' | 'failed'
-    """
-    if dest.exists() and is_valid_tar_xz(dest):
-        return ("skipped_existing", dest.stat().st_size, "already on disk")
+def remote_size(url: str) -> int | None:
+    try:
+        r = requests.head(
+            url,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True,
+            headers={"User-Agent": USER_AGENT},
+        )
+        if r.status_code != 200:
+            return None
+        cl = r.headers.get("Content-Length")
+        return int(cl) if cl is not None else None
+    except (requests.RequestException, ValueError):
+        return None
 
-    # Use a tmp path so an interrupted download never leaves a half file
-    # that looks legitimate but isn't.
+
+def download_file(name: str, url: str, dest: Path, force: bool) -> tuple[str, int, str]:
+    if not force and dest.exists() and is_valid_tar_xz(dest):
+        local_size = dest.stat().st_size
+        remote = remote_size(url)
+        if remote is None:
+            return ("skipped_existing", local_size, "valid locally; remote size unknown")
+        if remote == local_size:
+            return ("skipped_existing", local_size, "valid locally; size matches remote")
+
     tmp = dest.with_suffix(dest.suffix + ".part")
     if tmp.exists():
         tmp.unlink()
@@ -162,7 +166,6 @@ def download_file(name: str, url: str, dest: Path) -> tuple[str, int, str]:
             tmp.unlink()
         return ("failed", 0, f"download error: {e}")
 
-    # Validate before promoting from .part to final name.
     if not is_valid_tar_xz(tmp):
         size = tmp.stat().st_size if tmp.exists() else 0
         if tmp.exists():
@@ -173,14 +176,19 @@ def download_file(name: str, url: str, dest: Path) -> tuple[str, int, str]:
     return ("downloaded", dest.stat().st_size, "ok")
 
 
-# ---------- Main ----------
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force-current-season", action="store_true")
+    parser.add_argument("--current-season-floor", type=int, default=2025)
+    args = parser.parse_args(argv)
 
-def main() -> int:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"Repo root:    {REPO_ROOT}")
     print(f"Data folder:  {DATA_DIR}")
     print(f"Manifest:     {MANIFEST_PATH}")
+    if args.force_current_season:
+        print(f"Force-refresh seasons >= {args.current_season_floor}")
     print()
 
     print("Fetching upstream file list...")
@@ -188,7 +196,6 @@ def main() -> int:
     print(f"Upstream advertises {len(upstream)} files.")
 
     wanted = build_wanted_names()
-    # Only attempt names that exist upstream; record the rest as skipped-missing.
     in_scope = [n for n in wanted if n in upstream]
     out_of_scope = [n for n in wanted if n not in upstream]
     print(f"In scope for download (present upstream): {len(in_scope)}")
@@ -196,8 +203,6 @@ def main() -> int:
     print()
 
     results: dict[str, dict] = {}
-
-    # Pre-record the misses so they show up in the manifest cleanly.
     for name in out_of_scope:
         results[name] = {
             "status": "skipped_missing_upstream",
@@ -206,12 +211,18 @@ def main() -> int:
             "message": "not present in upstream list_data.txt",
         }
 
-    # Now do the actual downloads with an overall progress bar.
     print("Downloading...")
-    for i, name in enumerate(tqdm(in_scope, desc="overall", unit="file"), start=1):
+    for name in tqdm(in_scope, desc="overall", unit="file"):
         url = upstream[name]
         dest = DATA_DIR / f"{name}.tar.xz"
-        status, size, msg = download_file(name, url, dest)
+
+        force = False
+        if args.force_current_season:
+            s = season_of(name)
+            if s is not None and s >= args.current_season_floor:
+                force = True
+
+        status, size, msg = download_file(name, url, dest, force=force)
         results[name] = {
             "status": status,
             "url": url,
@@ -219,12 +230,10 @@ def main() -> int:
             "message": msg,
         }
         if status == "failed":
-            tqdm.write(f"  FAILED: {name} — {msg}")
-        # be polite
+            tqdm.write(f"  FAILED: {name} - {msg}")
         if status == "downloaded":
             time.sleep(INTER_FILE_DELAY)
 
-    # Write manifest.
     manifest = {
         "generated_at_unix": int(time.time()),
         "upstream_list_url": LIST_URL,
@@ -232,11 +241,12 @@ def main() -> int:
         "wanted_count": len(wanted),
         "in_scope_count": len(in_scope),
         "out_of_scope_count": len(out_of_scope),
+        "force_current_season": args.force_current_season,
+        "current_season_floor": args.current_season_floor,
         "files": results,
     }
     MANIFEST_PATH.write_text(json.dumps(manifest, indent=2))
 
-    # Summary.
     counts: dict[str, int] = {}
     total_bytes = 0
     for entry in results.values():
@@ -256,4 +266,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

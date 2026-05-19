@@ -1,0 +1,124 @@
+name: Weekly refresh
+
+# Runs every Sunday at 04:00 UTC (= 06:00 Madrid in summer, 05:00 in winter).
+# Also runnable manually from the Actions tab.
+on:
+  schedule:
+    - cron: "0 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      force_current_season:
+        description: "Force-refresh current-season files even if sizes match"
+        type: boolean
+        default: true
+      current_season_floor:
+        description: "Earliest season year to treat as current"
+        type: string
+        default: "2025"
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    # 6 hours is the GitHub Actions free-tier cap; we won't approach it,
+    # but it's a useful safety net if something gets stuck.
+    timeout-minutes: 350
+
+    permissions:
+      # Required for the gh CLI to create / update releases on this repo.
+      contents: write
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests tqdm pyarrow pandas huggingface_hub
+
+      - name: Determine refresh flags
+        id: flags
+        run: |
+          # Defaults for the cron-triggered case (where inputs.* are empty).
+          force="true"
+          floor="2025"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            force="${{ inputs.force_current_season }}"
+            floor="${{ inputs.current_season_floor }}"
+          fi
+          echo "force=$force"   >> "$GITHUB_OUTPUT"
+          echo "floor=$floor"   >> "$GITHUB_OUTPUT"
+
+      # Bring existing assets down from our GitHub Release so the download
+      # script only has to fetch new/changed files instead of all 276.
+      # `gh release download` skips files that already exist, so this is
+      # fast and safe on retry.
+      - name: Pre-populate data/ from existing releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p data
+          for tag in shotdetail matchups nbastats nbastatsv3 pbpstats datanba cdnnba; do
+            echo "Pulling existing $tag assets..."
+            # `|| true` lets us proceed even if a release has no assets yet.
+            gh release download "$tag" \
+              --repo jsierrahoopshype/nba-data-archive \
+              --dir data \
+              --skip-existing \
+              --pattern "*.tar.xz" || true
+          done
+          echo "Local data/ now has $(ls data/*.tar.xz 2>/dev/null | wc -l) files."
+
+      - name: Download from upstream
+        run: |
+          if [ "${{ steps.flags.outputs.force }}" = "true" ]; then
+            python scripts/01_download_archives.py \
+              --force-current-season \
+              --current-season-floor ${{ steps.flags.outputs.floor }}
+          else
+            python scripts/01_download_archives.py
+          fi
+
+      - name: Upload to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ steps.flags.outputs.force }}" = "true" ]; then
+            python scripts/02_upload_to_releases.py \
+              --clobber-current-season \
+              --current-season-floor ${{ steps.flags.outputs.floor }}
+          else
+            python scripts/02_upload_to_releases.py
+          fi
+
+      - name: Convert to Parquet
+        run: |
+          # Wipe parquet/ to force a clean rebuild every refresh. The
+          # conversion is fast (~1 min for 276 files on the runner) and
+          # this avoids drift between per-season and merged outputs when
+          # files have changed.
+          rm -rf parquet
+          python scripts/03_convert_to_parquet.py
+
+      - name: Upload to HuggingFace
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          # huggingface_hub picks up HF_TOKEN automatically; no `hf auth login`
+          # needed in CI.
+          python scripts/04_upload_to_huggingface.py
+
+      - name: Upload manifest as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-${{ github.run_id }}
+          path: data/_manifest.json
+          if-no-files-found: warn
+          retention-days: 90

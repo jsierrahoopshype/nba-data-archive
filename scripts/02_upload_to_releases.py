@@ -4,29 +4,29 @@
 Uploads downloaded .tar.xz archives to GitHub Releases on
 jsierrahoopshype/nba-data-archive.
 
-Strategy: one Release per data type, tagged with the data type name.
-This gives stable, predictable download URLs forever:
-
+One Release per data type, tagged with the data type name. Stable URL pattern:
   https://github.com/jsierrahoopshype/nba-data-archive/releases/download/
       <data_type>/<filename>.tar.xz
 
-For weekly refreshes, the same release tags get new assets uploaded over
-the top via --clobber.
-
 Resumable: queries each release for existing assets and skips files that
-are already there. Re-uploading the whole 1 GB after a crash is not fun.
+are already there.
+
+--clobber-current-season: re-uploads (overwrites) any file whose season is
+>= --current-season-floor. Useful for the cron, since active-season files
+upstream can be re-published without changing names.
 
 Prereqs:
-  - gh CLI installed and authenticated as jsierrahoopshype
+  - gh CLI installed and authenticated
   - data/ folder populated by 01_download_archives.py
 
 Usage:
   python scripts/02_upload_to_releases.py
+  python scripts/02_upload_to_releases.py --clobber-current-season
 """
 
 from __future__ import annotations
 
-import json
+import argparse
 import subprocess
 import sys
 from pathlib import Path
@@ -35,10 +35,6 @@ REPO = "jsierrahoopshype/nba-data-archive"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = REPO_ROOT / "data"
 
-# Per-data-type release configuration.
-# tag is the release tag (and part of the download URL).
-# title is the human-readable release name.
-# notes is the description shown on the release page.
 DATA_TYPES = {
     "shotdetail": {
         "title": "Shot Detail (1996/97 - 2025/26)",
@@ -110,8 +106,15 @@ DATA_TYPES = {
 }
 
 
+def season_of(filename: str) -> int | None:
+    stem = filename.removesuffix(".tar.xz")
+    for p in reversed(stem.split("_")):
+        if p.isdigit() and len(p) == 4:
+            return int(p)
+    return None
+
+
 def gh(*args: str, capture: bool = True) -> subprocess.CompletedProcess:
-    """Run gh CLI. capture=False streams output to terminal."""
     if capture:
         return subprocess.run(
             ["gh", *args], capture_output=True, text=True, encoding="utf-8"
@@ -123,13 +126,11 @@ def check_gh_ready() -> None:
     r = subprocess.run(["gh", "--version"], capture_output=True, text=True)
     if r.returncode != 0:
         print("ERROR: gh CLI is not installed.", file=sys.stderr)
-        print("Install with: winget install --id GitHub.cli", file=sys.stderr)
         sys.exit(1)
 
     r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
     if r.returncode != 0:
         print("ERROR: gh CLI is not authenticated.", file=sys.stderr)
-        print("Authenticate with: gh auth login", file=sys.stderr)
         sys.exit(1)
 
 
@@ -175,70 +176,102 @@ def get_existing_assets(tag: str) -> set[str]:
     return set(line.strip() for line in r.stdout.strip().splitlines() if line.strip())
 
 
-def upload_batch(tag: str, files: list[Path]) -> bool:
-    """Upload a list of files to a release. Streams gh output to terminal."""
+def upload_batch(tag: str, files: list[Path], clobber: bool) -> bool:
     if not files:
         return True
-    args = ["release", "upload", tag, "--repo", REPO, *[str(f) for f in files]]
+    args = ["release", "upload", tag, "--repo", REPO]
+    if clobber:
+        args.append("--clobber")
+    args.extend(str(f) for f in files)
     r = gh(*args, capture=False)
     return r.returncode == 0
 
 
-def main() -> int:
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--clobber-current-season", action="store_true")
+    parser.add_argument("--current-season-floor", type=int, default=2025)
+    args = parser.parse_args(argv)
+
     check_gh_ready()
 
     if not DATA_DIR.exists():
         print(f"ERROR: data folder not found: {DATA_DIR}", file=sys.stderr)
-        print("Run 01_download_archives.py first.", file=sys.stderr)
         return 1
 
     print(f"Repo:        {REPO}")
     print(f"Data folder: {DATA_DIR}")
+    if args.clobber_current_season:
+        print(f"Clobbering files for seasons >= {args.current_season_floor}")
     print()
 
-    totals = {"uploaded": 0, "skipped": 0, "missing": 0}
+    totals = {"uploaded": 0, "skipped": 0, "clobbered": 0}
 
     for tag, meta in DATA_TYPES.items():
         files = sorted(DATA_DIR.glob(f"{tag}_*.tar.xz"))
         if not files:
-            print(f"[{tag}] no files matching pattern, skipping release entirely")
+            print(f"[{tag}] no files matching pattern, skipping")
             continue
 
         print(f"\n=== {tag} ({len(files)} candidate files) ===")
         ensure_release(tag, meta["title"], meta["notes"])
 
         existing = get_existing_assets(tag)
-        to_upload = [f for f in files if f.name not in existing]
-        skipped = len(files) - len(to_upload)
 
-        print(f"  already on release: {skipped}")
-        print(f"  to upload:          {len(to_upload)}")
+        # Split: fresh uploads vs clobber re-uploads vs skip.
+        fresh: list[Path] = []
+        clobber: list[Path] = []
+        skipped = 0
 
-        if not to_upload:
-            totals["skipped"] += skipped
-            continue
+        for f in files:
+            if f.name not in existing:
+                fresh.append(f)
+                continue
+            # Already on release.
+            if args.clobber_current_season:
+                s = season_of(f.name)
+                if s is not None and s >= args.current_season_floor:
+                    clobber.append(f)
+                    continue
+            skipped += 1
 
-        # Upload in batches of 25 so a single failure doesn't lose much progress.
+        print(f"  already on release (skip):   {skipped}")
+        print(f"  new (to upload):             {len(fresh)}")
+        print(f"  clobber (current season):    {len(clobber)}")
+
+        # Fresh uploads, batched.
         BATCH = 25
-        uploaded_here = 0
-        for i in range(0, len(to_upload), BATCH):
-            batch = to_upload[i : i + BATCH]
-            print(
-                f"  uploading batch {i // BATCH + 1}/"
-                f"{(len(to_upload) + BATCH - 1) // BATCH} "
-                f"({len(batch)} files)..."
-            )
-            ok = upload_batch(tag, batch)
-            if not ok:
+        if fresh:
+            for i in range(0, len(fresh), BATCH):
+                batch = fresh[i : i + BATCH]
                 print(
-                    f"  WARN: batch upload to {tag} reported failure; "
-                    "rerun the script to retry remaining files",
-                    file=sys.stderr,
+                    f"  fresh batch {i // BATCH + 1}/"
+                    f"{(len(fresh) + BATCH - 1) // BATCH} ({len(batch)} files)..."
                 )
-                break
-            uploaded_here += len(batch)
+                if not upload_batch(tag, batch, clobber=False):
+                    print(
+                        f"  WARN: fresh batch failed on {tag}; rerun to retry",
+                        file=sys.stderr,
+                    )
+                    break
+            totals["uploaded"] += len(fresh)
 
-        totals["uploaded"] += uploaded_here
+        # Clobbers, batched.
+        if clobber:
+            for i in range(0, len(clobber), BATCH):
+                batch = clobber[i : i + BATCH]
+                print(
+                    f"  clobber batch {i // BATCH + 1}/"
+                    f"{(len(clobber) + BATCH - 1) // BATCH} ({len(batch)} files)..."
+                )
+                if not upload_batch(tag, batch, clobber=True):
+                    print(
+                        f"  WARN: clobber batch failed on {tag}; rerun to retry",
+                        file=sys.stderr,
+                    )
+                    break
+            totals["clobbered"] += len(clobber)
+
         totals["skipped"] += skipped
 
     print()
@@ -246,11 +279,9 @@ def main() -> int:
     for k, v in totals.items():
         print(f"  {k:20s} {v}")
     print()
-    print(
-        f"Releases page: https://github.com/{REPO}/releases"
-    )
+    print(f"Releases page: https://github.com/{REPO}/releases")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
