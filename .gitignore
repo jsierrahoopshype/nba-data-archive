@@ -1,0 +1,18 @@
+# Downloaded raw archives - these go to GitHub Releases, not the repo
+data/
+*.tar.xz
+*.parquet
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets - never commit these
+.env
+*.token
