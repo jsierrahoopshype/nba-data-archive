@@ -2,6 +2,7 @@
 data/
 *.tar.xz
 *.parquet
+parquet/
 
 # Python
 __pycache__/
