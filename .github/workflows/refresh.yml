@@ -1,6 +1,6 @@
 name: Weekly refresh
 
-# Runs every Sunday at 04:00 UTC (= 06:00 Madrid in summer, 05:00 in winter).
+# Runs every Sunday at 04:00 UTC.
 # Also runnable manually from the Actions tab.
 on:
   schedule:
@@ -19,12 +19,9 @@ on:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    # 6 hours is the GitHub Actions free-tier cap; we won't approach it,
-    # but it's a useful safety net if something gets stuck.
     timeout-minutes: 350
 
     permissions:
-      # Required for the gh CLI to create / update releases on this repo.
       contents: write
 
     steps:
@@ -36,16 +33,16 @@ jobs:
         with:
           python-version: "3.12"
           cache: "pip"
+          cache-dependency-path: requirements.txt
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests tqdm pyarrow pandas huggingface_hub
+          pip install -r requirements.txt
 
       - name: Determine refresh flags
         id: flags
         run: |
-          # Defaults for the cron-triggered case (where inputs.* are empty).
           force="true"
           floor="2025"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -55,10 +52,6 @@ jobs:
           echo "force=$force"   >> "$GITHUB_OUTPUT"
           echo "floor=$floor"   >> "$GITHUB_OUTPUT"
 
-      # Bring existing assets down from our GitHub Release so the download
-      # script only has to fetch new/changed files instead of all 276.
-      # `gh release download` skips files that already exist, so this is
-      # fast and safe on retry.
       - name: Pre-populate data/ from existing releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -66,7 +59,6 @@ jobs:
           mkdir -p data
           for tag in shotdetail matchups nbastats nbastatsv3 pbpstats datanba cdnnba; do
             echo "Pulling existing $tag assets..."
-            # `|| true` lets us proceed even if a release has no assets yet.
             gh release download "$tag" \
               --repo jsierrahoopshype/nba-data-archive \
               --dir data \
@@ -99,10 +91,6 @@ jobs:
 
       - name: Convert to Parquet
         run: |
-          # Wipe parquet/ to force a clean rebuild every refresh. The
-          # conversion is fast (~1 min for 276 files on the runner) and
-          # this avoids drift between per-season and merged outputs when
-          # files have changed.
           rm -rf parquet
           python scripts/03_convert_to_parquet.py
 
@@ -110,8 +98,6 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          # huggingface_hub picks up HF_TOKEN automatically; no `hf auth login`
-          # needed in CI.
           python scripts/04_upload_to_huggingface.py
 
       - name: Upload manifest as artifact
